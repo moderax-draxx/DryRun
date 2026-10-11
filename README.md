@@ -41,7 +41,7 @@ DryRun goes beyond basic variables. It automatically formats and renders:
 
 ## Release Notes
 
-### v2.0.0 (DryRun v2)
+### v2.0.1 (DryRun v2)
 - Complete UI rewrite natively integrated with VS Code panels.
 - Multi-language engine support for C++, Python, and Java.
 - Support for advanced data structures (Maps, Sets, Stacks, Queues, Graphs).
