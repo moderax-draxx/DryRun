@@ -119,13 +119,31 @@ function tokenize(sourceCode) {
             continue;
         }
 
-        // Numbers
+        // Numbers (including scientific notation like 1e9, 1e18, 2.5e-3 and suffixes like LL, ULL, f)
         if (/[0-9]/.test(char)) {
             let value = '';
             let hasDot = false;
-            while (pos < sourceCode.length && (/[0-9]/.test(peek()) || (!hasDot && peek() === '.'))) {
-                if (peek() === '.') hasDot = true;
-                value += advance();
+            let hasExp = false;
+            while (pos < sourceCode.length) {
+                const nextChar = peek();
+                if (/[0-9]/.test(nextChar)) {
+                    value += advance();
+                } else if (nextChar === '.' && !hasDot && !hasExp) {
+                    hasDot = true;
+                    value += advance();
+                } else if ((nextChar === 'e' || nextChar === 'E') && !hasExp) {
+                    hasExp = true;
+                    value += advance();
+                    if (peek() === '+' || peek() === '-') {
+                        value += advance();
+                    }
+                } else {
+                    break;
+                }
+            }
+            // Consume optional literal suffixes like LL, ULL, U, L, f, etc.
+            while (pos < sourceCode.length && /[uUlLfF]/.test(peek())) {
+                advance();
             }
             addToken(TokenType.NUMBER, value, startLine, startCol);
             continue;

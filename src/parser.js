@@ -134,7 +134,7 @@ function parse(tokens) {
             TokenType.INT, TokenType.LONG, TokenType.DOUBLE, TokenType.FLOAT,
             TokenType.CHAR, TokenType.STRING, TokenType.BOOL, TokenType.VOID,
             TokenType.VECTOR, TokenType.AUTO, TokenType.SIGNED, TokenType.UNSIGNED,
-            TokenType.MAP, TokenType.SET
+            TokenType.MAP, TokenType.SET, TokenType.PAIR
         ].includes(token.type);
     }
 
@@ -144,7 +144,7 @@ function parse(tokens) {
         const typeTok = match(TokenType.INT, TokenType.LONG, TokenType.DOUBLE, TokenType.FLOAT,
             TokenType.CHAR, TokenType.STRING, TokenType.BOOL, TokenType.VOID,
             TokenType.AUTO, TokenType.VECTOR, TokenType.SIGNED, TokenType.UNSIGNED,
-            TokenType.MAP, TokenType.SET);
+            TokenType.MAP, TokenType.SET, TokenType.PAIR);
         if (!typeTok) throw new Error("Expected type at line " + peek().line);
 
         // 'signed' alone → treat as 'int', 'signed main' → 'int'
@@ -188,7 +188,55 @@ function parse(tokens) {
             return 'long';
         }
         
-        return typeTok.value;
+        let baseType = typeTok.value;
+        
+        // Parse template arguments: vector<...>, map<...,..>, set<...>, etc.
+        if (peek().type === TokenType.LESS) {
+            consume(TokenType.LESS);
+            // Collect all tokens inside the outermost <...> tracking depth
+            let depth = 1;
+            let parts = []; // flat token values with spaces
+            while (peek().type !== TokenType.EOF) {
+                const cur = peek();
+                if (cur.type === TokenType.LESS) {
+                    depth++;
+                    parts.push('<');
+                    pos++;
+                } else if (cur.type === TokenType.GREATER) {
+                    depth--;
+                    if (depth === 0) { pos++; break; }
+                    parts.push('>');
+                    pos++;
+                } else if (cur.type === TokenType.RIGHT_SHIFT) {
+                    // >> closes two levels
+                    if (depth === 1) { pos++; break; } // closes this level (treat as >)
+                    if (depth === 2) { pos++; depth -= 2; break; }
+                    // depth > 2: treat as two >
+                    depth -= 2;
+                    parts.push('>>');
+                    pos++;
+                } else if (cur.type === TokenType.COMMA && depth === 1) {
+                    parts.push(',');
+                    pos++;
+                } else {
+                    // Preserve spacing for multi-word types (long long, unsigned int)
+                    const lastPart = parts[parts.length - 1];
+                    const needsSpace = lastPart && lastPart !== '<' && lastPart !== ',' && !lastPart.endsWith('<');
+                    if (needsSpace && /^[a-zA-Z_]/.test(cur.value)) parts.push(' ');
+                    parts.push(cur.value);
+                    pos++;
+                }
+            }
+            baseType = `${baseType}<${parts.join('')}>`;
+        }
+        
+        // Consume & for reference types (used in function params)
+        if (peek().type === TokenType.BITWISE_AND) {
+            pos++;
+            baseType = baseType + '&';
+        }
+        
+        return baseType;
     }
 
     function parseStatement() {
@@ -388,24 +436,72 @@ function parse(tokens) {
 
     function parseDeclaration() {
         const line = peek().line;
-        const typeStr = parseType();
+        const typeStr = parseType(); // Now returns full type like vector<long long>, map<int,int>, etc.
 
+        // Helper to detect base container type from the full type string
+        function getBaseContainer(t) {
+            const lower = t.toLowerCase();
+            if (lower.startsWith('unordered_map')) return 'unordered_map';
+            if (lower.startsWith('unordered_set')) return 'unordered_set';
+            if (lower.startsWith('priority_queue')) return 'priority_queue';
+            if (lower.startsWith('vector')) return 'vector';
+            if (lower.startsWith('stack')) return 'stack';
+            if (lower.startsWith('queue')) return 'queue';
+            if (lower.startsWith('deque')) return 'deque';
+            if (lower.startsWith('set')) return 'set';
+            if (lower.startsWith('map')) return 'map';
+            return null;
+        }
+        
+        const baseContainer = getBaseContainer(typeStr);
+        
         // Container declarations (vector, stack, queue, deque, priority_queue, set, map)
-        if (['vector', 'stack', 'queue', 'deque', 'priority_queue', 'set', 'map', 'unordered_map', 'unordered_set'].includes(typeStr)) {
-            consume(TokenType.LESS);
+        if (baseContainer) {
+            // Extract element type from the full type string like vector<long long> or map<int,long long>
+            // The template args are already embedded in typeStr from parseType
+            // But we still need to consume the name and optional constructor args
             
-            let elementType = null;
+            // typeStr now looks like "vector<long long>" or "map<int,long long>" or just "vector" if no template was found
+            // If typeStr has no angle brackets, parse them now (backward compat)
+            let fullTypeStr = typeStr;
+            let elementType = 'int'; // fallback
             let keyType = null;
             
-            if (['map', 'unordered_map'].includes(typeStr)) {
-                keyType = parseType();
-                consume(TokenType.COMMA);
-                elementType = parseType(); // this is the valueType
+            if (!typeStr.includes('<')) {
+                // Old path: manually consume template args (shouldn't happen with new parseType but keep as fallback)
+                if (peek().type === TokenType.LESS) {
+                    consume(TokenType.LESS);
+                    if (['map', 'unordered_map'].includes(baseContainer)) {
+                        keyType = parseType();
+                        consume(TokenType.COMMA);
+                        elementType = parseType();
+                    } else {
+                        elementType = parseType();
+                    }
+                    if (peek().type === TokenType.GREATER) consume(TokenType.GREATER);
+                    if (keyType) fullTypeStr = `${baseContainer}<${keyType},${elementType}>`;
+                    else fullTypeStr = `${baseContainer}<${elementType}>`;
+                }
             } else {
-                elementType = parseType();
+                // Extract elementType from full type string for the interpreter
+                const tmatch = typeStr.match(/^[^<]+<(.+)>$/);
+                if (tmatch) {
+                    const innerStr = tmatch[1];
+                    if (['map', 'unordered_map'].includes(baseContainer)) {
+                        // Split on first comma only
+                        const commaIdx = innerStr.indexOf(',');
+                        if (commaIdx !== -1) {
+                            keyType = innerStr.substring(0, commaIdx).trim();
+                            elementType = innerStr.substring(commaIdx + 1).trim();
+                        } else {
+                            elementType = innerStr.trim();
+                        }
+                    } else {
+                        elementType = innerStr.trim();
+                    }
+                }
             }
             
-            consume(TokenType.GREATER);
             const nameTok = consume(TokenType.IDENTIFIER);
             
             let sizeExpr = null;
@@ -431,14 +527,6 @@ function parse(tokens) {
             }
 
             consume(TokenType.SEMICOLON);
-            
-            // Format type string for the interpreter's isStackType, isMapType etc.
-            let fullTypeStr;
-            if (['map', 'unordered_map'].includes(typeStr)) {
-                fullTypeStr = `${typeStr}<${keyType},${elementType}>`;
-            } else {
-                fullTypeStr = `${typeStr}<${elementType}>`;
-            }
 
             return { type: 'VectorDeclaration', containerType: fullTypeStr, elementType, name: nameTok.value, sizeExpr, fillExpr, initList, line };
         }
@@ -610,6 +698,23 @@ function parse(tokens) {
                 } else {
                     expr = { type: 'MemberAccess', object: expr, member: member.value, line: expr.line };
                 }
+            } else if (match(TokenType.SCOPE)) {
+                // Scope resolution: std::min, chrono::now(), ios_base::sync_with_stdio()
+                const member = consume(TokenType.IDENTIFIER, "Expected identifier after ::");
+                if (peek().type === TokenType.LPAREN) {
+                    consume(TokenType.LPAREN);
+                    const args = [];
+                    if (peek().type !== TokenType.RPAREN) {
+                        args.push(parseExpression());
+                        while (match(TokenType.COMMA)) {
+                            args.push(parseExpression());
+                        }
+                    }
+                    consume(TokenType.RPAREN);
+                    expr = { type: 'ScopeMethodCall', object: expr, method: member.value, arguments: args, line: expr.line };
+                } else {
+                    expr = { type: 'ScopeAccess', object: expr, member: member.value, line: expr.line };
+                }
             } else if (match(TokenType.INCREMENT)) {
                 expr = { type: 'UpdateExpression', operator: '++', argument: expr, prefix: false, line: expr.line };
             } else if (match(TokenType.DECREMENT)) {
@@ -650,6 +755,47 @@ function parse(tokens) {
             const expr = parseExpression();
             consume(TokenType.RPAREN);
             return expr;
+        }
+
+        // Support container constructors / casts in expressions like vi(2) -> vector<long long>(2)
+        if (isType(token)) {
+            const typeStr = parseType();
+            if (match(TokenType.LPAREN)) {
+                const args = [];
+                if (peek().type !== TokenType.RPAREN) {
+                    args.push(parseExpression());
+                    while (match(TokenType.COMMA)) {
+                        args.push(parseExpression());
+                    }
+                }
+                consume(TokenType.RPAREN);
+                return { type: 'ConstructorCall', targetType: typeStr, arguments: args, line };
+            }
+            if (match(TokenType.LBRACE)) {
+                const args = [];
+                if (peek().type !== TokenType.RBRACE) {
+                    args.push(parseExpression());
+                    while (match(TokenType.COMMA)) {
+                        args.push(parseExpression());
+                    }
+                }
+                consume(TokenType.RBRACE);
+                return { type: 'ConstructorCall', targetType: typeStr, arguments: args, isInitList: true, line };
+            }
+            return { type: 'TypeNode', targetType: typeStr, line };
+        }
+
+        // Array literal / initializer list: {1, 2, 3}
+        if (match(TokenType.LBRACE)) {
+            const elements = [];
+            if (peek().type !== TokenType.RBRACE) {
+                elements.push(parseExpression());
+                while (match(TokenType.COMMA)) {
+                    elements.push(parseExpression());
+                }
+            }
+            consume(TokenType.RBRACE);
+            return { type: 'ArrayLiteral', elements, line };
         }
         
         throw new Error("Unexpected token " + token.type + " at line " + token.line);

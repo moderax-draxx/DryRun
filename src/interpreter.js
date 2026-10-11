@@ -47,7 +47,7 @@ class Interpreter {
             for (const [key, val] of scope.entries()) {
                 snapshot[key] = {
                     type: val.type,
-                    value: Array.isArray(val.value) ? [...val.value] : 
+                    value: Array.isArray(val.value) ? val.value.map(item => Array.isArray(item) ? [...item] : (item && typeof item === 'object' ? { ...item } : item)) : 
                            (val.value && typeof val.value === 'object' && !Array.isArray(val.value)) 
                                ? { ...val.value } : val.value,
                     isArray: val.isArray,
@@ -110,6 +110,37 @@ class Interpreter {
             }
         }
         throw new Error(`Variable '${name}' is not defined`);
+    }
+
+    // Returns the raw variable object (not just value) — for pass-by-reference
+    _getRawVariable(name) {
+        for (let i = this.scopes.length - 1; i >= 0; i--) {
+            if (this.scopes[i].has(name)) {
+                return this.scopes[i].get(name);
+            }
+        }
+        throw new Error(`Variable '${name}' is not defined`);
+    }
+
+    // Resolves chained ArrayAccess (e.g. arr[i], arr[i][j], map[key]) down to container and index
+    _resolveArrayTarget(accessNode) {
+        if (!accessNode || accessNode.type !== 'ArrayAccess') return null;
+        if (accessNode.object.type === 'Identifier') {
+            const name = accessNode.object.name;
+            const index = this.evaluate(accessNode.index);
+            const v = this.getVariable(name);
+            if (v.isMap) {
+                return { container: v.value, index: String(index), name: `${name}[${index}]`, isMap: true, typeHint: v.type };
+            }
+            return { container: v.value, index: index, name: `${name}[${index}]`, isMap: false, typeHint: v.type };
+        } else if (accessNode.object.type === 'ArrayAccess') {
+            const outer = this._resolveArrayTarget(accessNode.object);
+            if (!outer || outer.container === undefined || outer.container === null) return null;
+            const index = this.evaluate(accessNode.index);
+            const innerContainer = outer.container[outer.index];
+            return { container: innerContainer, index: index, name: `${outer.name}[${index}]`, isMap: false, typeHint: outer.typeHint };
+        }
+        return null;
     }
 
     getDefaultValue(type) {
@@ -218,13 +249,24 @@ class Interpreter {
 
         // Regular vector/array
         let size = 0;
-        let fill = this.getDefaultValue(node.elementType);
         let valArray = [];
+        
+        // Detect if this is a 2D vector (element type contains 'vector')
+        const elementType = node.elementType || '';
+        const is2DVector = elementType.includes('vector');
         
         if (node.sizeExpr) {
             size = this.evaluate(node.sizeExpr);
-            if (node.fillExpr) fill = this.evaluate(node.fillExpr);
-            for (let i = 0; i < size; i++) valArray.push(fill);
+            if (node.fillExpr) {
+                // For 2D vectors, evaluate fill separately for each row to avoid reference sharing
+                for (let i = 0; i < size; i++) {
+                    const fill = this.evaluate(node.fillExpr);
+                    valArray.push(is2DVector && Array.isArray(fill) ? [...fill] : fill);
+                }
+            } else {
+                const fill = this.getDefaultValue(elementType);
+                for (let i = 0; i < size; i++) valArray.push(fill);
+            }
         } else if (node.initList) {
             size = node.initList.length;
             valArray = node.initList.map(e => this.evaluate(e));
@@ -306,17 +348,16 @@ class Interpreter {
                         this.updateVariable(target.name, parsedVal);
                         this.addStep(node.line, 'input', `Read input: ${target.name} = ${parsedVal}`, target.name);
                     } else if (target.type === 'ArrayAccess') {
-                        const name = target.object.name;
-                        const index = this.evaluate(target.index);
-                        const v = this.getVariable(name);
-                        
-                        let parsedVal = token;
-                        const t = (v.type || '').toLowerCase();
-                        if (t.includes('int') || t.includes('long')) parsedVal = parseInt(token, 10);
-                        else if (t.includes('double') || t.includes('float')) parsedVal = parseFloat(token);
-                        
-                        v.value[index] = parsedVal;
-                        this.addStep(node.line, 'input', `Read input: ${name}[${index}] = ${parsedVal}`, name, index);
+                        const resolved = this._resolveArrayTarget(target);
+                        if (resolved && resolved.container !== undefined && resolved.container !== null) {
+                            let parsedVal = token;
+                            const t = (resolved.typeHint || '').toLowerCase();
+                            if (t.includes('int') || t.includes('long')) parsedVal = parseInt(token, 10);
+                            else if (t.includes('double') || t.includes('float')) parsedVal = parseFloat(token);
+                            else parsedVal = parseInt(token, 10); // default to int
+                            resolved.container[resolved.index] = parsedVal;
+                            this.addStep(node.line, 'input', `Read input: ${resolved.name} = ${parsedVal}`);
+                        }
                     }
                 }
                 break;
@@ -484,31 +525,23 @@ class Interpreter {
             this.addStep(line, 'assign', `${target.name} = ${newVal}`, target.name);
             return newVal;
         } else if (target.type === 'ArrayAccess') {
-            const name = target.object.name;
-            const index = this.evaluate(target.index);
-            const v = this.getVariable(name);
-            
-            // Map/dict access via [] operator
-            if (v.isMap) {
+            const resolved = this._resolveArrayTarget(target);
+            if (resolved && resolved.container !== undefined && resolved.container !== null) {
+                let currentVal = resolved.container[resolved.index];
+                if (resolved.isMap && currentVal === undefined) currentVal = 0;
+                
                 let newVal = val;
-                if (operator === '+=') newVal = (v.value[index] || 0) + val;
-                else if (operator === '-=') newVal = (v.value[index] || 0) - val;
-                else if (operator === '*=') newVal = (v.value[index] || 0) * val;
-                v.value[String(index)] = newVal;
-                this.addStep(line, 'assign', `${name}[${index}] = ${newVal}`, name);
+                if (operator === '+=') newVal = currentVal + val;
+                else if (operator === '-=') newVal = currentVal - val;
+                else if (operator === '*=') newVal = currentVal * val;
+                else if (operator === '/=') newVal = Math.trunc(currentVal / val);
+                else if (operator === '%=') newVal = currentVal % val;
+                
+                resolved.container[resolved.index] = newVal;
+                this.addStep(line, 'assign', `${resolved.name} = ${newVal}`);
                 return newVal;
             }
-            
-            let newVal = val;
-            if (operator === '+=') newVal = v.value[index] + val;
-            else if (operator === '-=') newVal = v.value[index] - val;
-            else if (operator === '*=') newVal = v.value[index] * val;
-            else if (operator === '/=') newVal = Math.trunc(v.value[index] / val);
-            else if (operator === '%=') newVal = v.value[index] % val;
-            
-            v.value[index] = newVal;
-            this.addStep(line, 'assign', `${name}[${index}] = ${newVal}`, name, index);
-            return newVal;
+            throw new Error("Invalid assignment target");
         }
         throw new Error("Invalid assignment target");
     }
@@ -525,11 +558,74 @@ class Interpreter {
                 return node.value;
                 
             case 'Identifier':
+                if (node.name === 'INT_MIN') return -2147483648;
+                if (node.name === 'INT_MAX') return 2147483647;
+                if (node.name === 'LLONG_MIN') return -9223372036854775808;
+                if (node.name === 'LLONG_MAX') return 9223372036854775807;
+                if (node.name === 'NULL' || node.name === 'nullptr') return null;
                 try {
                     return this.getVariable(node.name).value;
                 } catch {
                     return null;
                 }
+
+            case 'ConstructorCall': {
+                const targetType = (node.targetType || '').toLowerCase();
+                const evalArgs = (node.arguments || []).map(a => this.evaluate(a));
+                
+                if (targetType.startsWith('vector')) {
+                    const sz = evalArgs.length > 0 ? (evalArgs[0] || 0) : 0;
+                    const fill = evalArgs.length > 1 ? evalArgs[1] : 0;
+                    const res = [];
+                    for (let i = 0; i < sz; i++) {
+                        res.push(Array.isArray(fill) ? [...fill] : (fill && typeof fill === 'object' ? { ...fill } : fill));
+                    }
+                    return res;
+                }
+                
+                if (targetType.startsWith('pair')) {
+                    return {
+                        first: evalArgs.length > 0 ? evalArgs[0] : 0,
+                        second: evalArgs.length > 1 ? evalArgs[1] : 0
+                    };
+                }
+                
+                if (targetType.startsWith('string')) {
+                    if (evalArgs.length === 2 && typeof evalArgs[0] === 'number') {
+                        return String(evalArgs[1]).repeat(evalArgs[0]);
+                    }
+                    return evalArgs.length > 0 ? String(evalArgs[0]) : "";
+                }
+                
+                if (['int', 'long', 'long long', 'short', 'unsigned int', 'unsigned long', 'unsigned long long'].includes(targetType)) {
+                    return evalArgs.length > 0 ? (parseInt(evalArgs[0], 10) || 0) : 0;
+                }
+                
+                if (['double', 'float'].includes(targetType)) {
+                    return evalArgs.length > 0 ? (parseFloat(evalArgs[0]) || 0.0) : 0.0;
+                }
+                
+                if (targetType === 'bool') {
+                    return evalArgs.length > 0 ? Boolean(evalArgs[0]) : false;
+                }
+                
+                if (targetType.startsWith('set') || targetType.startsWith('unordered_set')) {
+                    return [];
+                }
+                
+                if (targetType.startsWith('map') || targetType.startsWith('unordered_map')) {
+                    return {};
+                }
+                
+                return evalArgs.length > 0 ? evalArgs[0] : 0;
+            }
+
+            case 'ArrayLiteral':
+                return (node.elements || []).map(e => this.evaluate(e));
+
+            case 'ScopeAccess':
+            case 'ScopeMethodCall':
+                return null;
                 
             
             case 'MemberAccess': {
@@ -603,13 +699,13 @@ class Interpreter {
                     this.updateVariable(name, newVal);
                     return node.prefix ? newVal : oldVal;
                 } else if (node.argument.type === 'ArrayAccess') {
-                    const name = node.argument.object.name;
-                    const index = String(this.evaluate(node.argument.index));
-                    const v = this.getVariable(name);
-                    let oldVal = v.isMap ? (v.value[index] || 0) : v.value[index];
-                    const newVal = node.operator === '++' ? oldVal + 1 : oldVal - 1;
-                    v.value[index] = newVal;
-                    return node.prefix ? newVal : oldVal;
+                    const resolved = this._resolveArrayTarget(node.argument);
+                    if (resolved && resolved.container !== undefined && resolved.container !== null) {
+                        let oldVal = resolved.container[resolved.index] ?? 0;
+                        const newVal = node.operator === '++' ? oldVal + 1 : oldVal - 1;
+                        resolved.container[resolved.index] = newVal;
+                        return node.prefix ? newVal : oldVal;
+                    }
                 }
                 throw new Error("Invalid update target");
             }
@@ -653,9 +749,15 @@ class Interpreter {
                     return null;
                 }
                 
-                // Built-in: max, min, abs, sqrt, pow, ceil, floor, log
-                if (callee === 'max' && args.length >= 2) return Math.max(this.evaluate(args[0]), this.evaluate(args[1]));
-                if (callee === 'min' && args.length >= 2) return Math.min(this.evaluate(args[0]), this.evaluate(args[1]));
+                // Built-in: max, min, abs, sqrt, pow, ceil, floor, log, make_pair
+                if (callee === 'make_pair') {
+                    return {
+                        first: args.length > 0 ? this.evaluate(args[0]) : 0,
+                        second: args.length > 1 ? this.evaluate(args[1]) : 0
+                    };
+                }
+                if (callee === 'max' && args.length >= 2) return Math.max(...args.map(a => this.evaluate(a)));
+                if (callee === 'min' && args.length >= 2) return Math.min(...args.map(a => this.evaluate(a)));
                 if (callee === 'abs' && args.length === 1) return Math.abs(this.evaluate(args[0]));
                 if (callee === 'sqrt') return Math.sqrt(this.evaluate(args[0]));
                 if (callee === 'pow') return Math.pow(this.evaluate(args[0]), this.evaluate(args[1]));
@@ -672,20 +774,48 @@ class Interpreter {
                 // User-defined function
                 if (this.functions.has(callee)) {
                     const func = this.functions.get(callee);
-                    const evalArgs = args.map(a => this.evaluate(a));
                     
-                    const callSig = `${callee}(${evalArgs.join(', ')})`;
+                    const callSig = `${callee}(...)`;
                     this.callStack.push(callSig);
                     
+                    // 1. Evaluate arguments in the CALLER's scope before pushing callee scope
+                    const evalArgs = [];
+                    for (let i = 0; i < func.params.length; i++) {
+                        const pType = func.params[i].type || '';
+                        const isRef = pType.includes('&') || pType.includes('ref');
+                        if (isRef && i < args.length && args[i].type === 'Identifier') {
+                            try {
+                                const originalVarObj = this._getRawVariable(args[i].name);
+                                evalArgs.push({ isRef: true, rawVar: originalVarObj });
+                            } catch(e) {
+                                const pVal = this.evaluate(args[i]);
+                                evalArgs.push({ isRef: false, val: pVal });
+                            }
+                        } else {
+                            const pVal = i < args.length ? this.evaluate(args[i]) : this.getDefaultValue(pType);
+                            evalArgs.push({ isRef: false, val: pVal });
+                        }
+                    }
+                    
+                    // 2. NOW push the new scope for the callee and bind parameters
                     this.pushScope();
                     for (let i = 0; i < func.params.length; i++) {
                         const pName = func.params[i].name;
-                        const pType = func.params[i].type;
-                        const pVal = i < evalArgs.length ? evalArgs[i] : this.getDefaultValue(pType);
-                        this.declareVariable(pName, pType, pVal);
+                        const pType = func.params[i].type || '';
+                        const argInfo = evalArgs[i];
+                        if (argInfo.isRef) {
+                            this.scopes[this.scopes.length - 1].set(pName, argInfo.rawVar);
+                        } else {
+                            const pVal = argInfo.val;
+                            if (Array.isArray(pVal)) {
+                                this.declareVariable(pName, pType, pVal, true);
+                            } else {
+                                this.declareVariable(pName, pType, pVal);
+                            }
+                        }
                     }
                     
-                    this.addStep(node.line, 'call', `Calling ${callSig}`);
+                    this.addStep(node.line, 'call', `Calling ${callee}()`);
                     
                     // ── BUG FIX: save/restore returnValue so recursive calls don't clobber it ──
                     const savedReturnValue = this.returnValue;
@@ -709,6 +839,7 @@ class Interpreter {
                     this.popScope();
                     this.callStack.pop();
                     this.addStep(node.line, 'call-return', `${callee}() returned`);
+
                     this.returnValue = savedReturnValue;
                     return null;
                 }
@@ -820,7 +951,9 @@ class Interpreter {
                         }
 
                         // ── Vector/Array methods ──────────────────────────────────
-                        if (v.isArray) {
+                        // Also handle plain arrays not tagged with isArray (e.g., passed as params)
+                        const vIsArray = v.isArray || Array.isArray(v.value);
+                        if (vIsArray) {
                             if (method === 'push_back' || method === 'pb') {
                                 const val = this.evaluate(node.arguments[0]);
                                 v.value.push(val);
@@ -834,6 +967,13 @@ class Interpreter {
                                 return null;
                             } else if (method === 'size') {
                                 return v.value.length;
+                            } else if (method === 'resize') {
+                                const newSize = this.evaluate(node.arguments[0]);
+                                const fillVal = node.arguments[1] ? this.evaluate(node.arguments[1]) : 0;
+                                while (v.value.length < newSize) v.value.push(fillVal);
+                                while (v.value.length > newSize) v.value.pop();
+                                v.size = v.value.length;
+                                return null;
                             } else if (method === 'clear') {
                                 v.value = [];
                                 v.size = 0;
@@ -851,8 +991,25 @@ class Interpreter {
                         }
                     } catch (e) {}
                 }
+                
+                // Fallback for evaluated expression objects (e.g. arr[i].size(), str.length())
+                try {
+                    const objVal = this.evaluate(node.object);
+                    if (Array.isArray(objVal)) {
+                        if (method === 'size') return objVal.length;
+                        if (method === 'empty') return objVal.length === 0;
+                        if (method === 'back') return objVal[objVal.length - 1];
+                        if (method === 'front') return objVal[0];
+                    }
+                    if (typeof objVal === 'string') {
+                        if (method === 'size' || method === 'length') return objVal.length;
+                        if (method === 'empty') return objVal.length === 0;
+                    }
+                } catch(e) {}
+                
                 return null;
             }
+
         }
         throw new Error(`Unknown expression type: ${node.type}`);
     }
